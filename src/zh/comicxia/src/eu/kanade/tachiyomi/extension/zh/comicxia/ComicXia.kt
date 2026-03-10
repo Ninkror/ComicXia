@@ -6,79 +6,195 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
+import eu.kanade.tachiyomi.source.online.HttpSource
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.intOrNull
 import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
+import org.jsoup.Jsoup
 
-class ComicXia : ParsedHttpSource() {
+/**
+ * ComicXia extension — uses the internal REST API (`/api/v1/...`) rather than
+ * HTML parsing, because the site is a Next.js SPA that ships zero comic DOM
+ * in its server-rendered HTML.
+ *
+ * Confirmed API structure (2026-03-11):
+ *   GET /api/v1/comics?sort=view&page=N       → popular
+ *   GET /api/v1/comics?sort=updated&page=N    → latest
+ *   GET /api/v1/comics?q=QUERY&page=N         → search (TODO: verify param)
+ *   GET /api/v1/comics/{id}                   → manga details
+ *   GET /api/v1/comics/{id}/chapters?page=1&limit=500 → chapter list
+ *   GET /read/{chapterId}                     → reader page (parse images from JS payload)
+ */
+class ComicXia : HttpSource() {
 
-    override val name = "漫画侠"
+    override val name = "ComicXia"
     override val baseUrl = "https://www.comicxia.com"
     override val lang = "zh"
     override val supportsLatest = true
 
+    private val apiBase = "$baseUrl/api/v1"
+
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
-        .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
         .add("Referer", baseUrl)
+        .add("Accept", "application/json")
+
+    private val json = Json { ignoreUnknownKeys = true }
 
     // ============================== Popular ===============================
 
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/rank?page=$page", headers)
+    override fun popularMangaRequest(page: Int): Request =
+        GET("$apiBase/comics?sort=view&page=$page&limit=20", headers)
 
-    override fun popularMangaParse(response: Response): MangasPage = parseMangaList(response, baseUrl)
-
-    override fun popularMangaSelector() = "a[href^=/comics/]"
-
-    override fun popularMangaFromElement(element: Element): SManga = mangaFromElement(element)
-
-    override fun popularMangaNextPageSelector(): String? = null
+    override fun popularMangaParse(response: Response): MangasPage =
+        parseMangaListResponse(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$baseUrl/categories?sort=updated&page=$page", headers)
+    override fun latestUpdatesRequest(page: Int): Request =
+        GET("$apiBase/comics?sort=updated&page=$page&limit=20", headers)
 
-    override fun latestUpdatesParse(response: Response): MangasPage = parseMangaList(response, baseUrl)
-
-    override fun latestUpdatesSelector() = popularMangaSelector()
-
-    override fun latestUpdatesFromElement(element: Element): SManga = mangaFromElement(element)
-
-    override fun latestUpdatesNextPageSelector(): String? = null
+    override fun latestUpdatesParse(response: Response): MangasPage =
+        parseMangaListResponse(response)
 
     // =============================== Search ===============================
 
-    // Browser confirmed: the search page uses `q` as the keyword param (not `keyword`)
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request =
-        GET("$baseUrl/search?q=$query&page=$page", headers)
+        GET("$apiBase/comics?q=${query.trim()}&page=$page&limit=20", headers)
 
-    override fun searchMangaParse(response: Response): MangasPage = parseMangaList(response, baseUrl)
-
-    override fun searchMangaSelector() = popularMangaSelector()
-
-    override fun searchMangaFromElement(element: Element): SManga = mangaFromElement(element)
-
-    override fun searchMangaNextPageSelector(): String? = null
+    override fun searchMangaParse(response: Response): MangasPage =
+        parseMangaListResponse(response)
 
     // =========================== Manga Details ============================
 
-    override fun mangaDetailsParse(document: Document): SManga = parseMangaDetails(document)
+    /**
+     * The comic URL is stored as `/comics/{id}`, so we strip the path to get the ID.
+     * Then we call /api/v1/comics/{id} for full details.
+     */
+    override fun mangaDetailsRequest(manga: SManga): Request {
+        val id = manga.url.removePrefix("/comics/").trimEnd('/')
+        return GET("$apiBase/comics/$id", headers)
+    }
+
+    override fun mangaDetailsParse(response: Response): SManga {
+        val obj = json.parseToJsonElement(response.body.string()).jsonObject
+        return SManga.create().apply {
+            url = "/comics/${obj["id"]?.jsonPrimitive?.content}"
+            title = obj["title"]?.jsonPrimitive?.content ?: ""
+            author = obj["author"]?.jsonPrimitive?.content
+            description = obj["description"]?.jsonPrimitive?.content
+            genre = obj["tags"]?.jsonArray?.joinToString { it.jsonPrimitive.content }
+            status = when (obj["status"]?.jsonPrimitive?.intOrNull) {
+                0 -> SManga.ONGOING
+                1 -> SManga.COMPLETED
+                else -> SManga.UNKNOWN
+            }
+            thumbnail_url = obj["cover_original_url"]?.jsonPrimitive?.content
+                ?.ifBlank { obj["cover_image"]?.jsonPrimitive?.content }
+        }
+    }
 
     // ============================== Chapters ==============================
 
-    override fun chapterListParse(response: Response): List<SChapter> = parseChapterList(response, baseUrl)
+    override fun chapterListRequest(manga: SManga): Request {
+        val id = manga.url.removePrefix("/comics/").trimEnd('/')
+        return GET("$apiBase/comics/$id/chapters?page=1&limit=500", headers)
+    }
 
-    override fun chapterListSelector() = error("Not used")
+    override fun chapterListParse(response: Response): List<SChapter> {
+        val obj = json.parseToJsonElement(response.body.string()).jsonObject
+        val data = obj["data"]?.jsonArray ?: return emptyList()
 
-    override fun chapterFromElement(element: Element): SChapter = error("Not used")
+        return data.map { el ->
+            val chapter = el.jsonObject
+            SChapter.create().apply {
+                val chapterId = chapter["id"]?.jsonPrimitive?.content ?: ""
+                url = "/read/$chapterId"
+                name = chapter["title"]?.jsonPrimitive?.content
+                    ?.removePrefix("NEW").trim()
+                    ?: "Chapter $chapterId"
+                date_upload = 0L
+            }
+        }.reversed() // API returns oldest-first; reverse for newest-first display
+    }
 
     // =============================== Pages ================================
 
-    override fun pageListParse(response: Response): List<Page> = parsePageList(response)
+    override fun pageListRequest(chapter: SChapter): Request =
+        GET("$baseUrl${chapter.url}", headers)
 
-    override fun pageListParse(document: Document): List<Page> = error("Not used")
+    override fun pageListParse(response: Response): List<Page> {
+        val body = response.body.string()
+        val document = Jsoup.parse(body)
 
-    override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException("Not used.")
+        // Strategy 1: img tags with chapter images
+        val imgElements = document.select(
+            "img[src*=/chapter/], img[data-src*=/chapter/], div.chapter-img img",
+        )
+        if (imgElements.isNotEmpty()) {
+            return imgElements.mapIndexed { i, img ->
+                Page(i, imageUrl = img.attr("data-src").ifBlank { img.attr("src") })
+            }
+        }
+
+        // Strategy 2: scan Next.js RSC payload for image URLs
+        val imgUrlRegex = "\"(https?://[^\"]*(?:jpg|jpeg|png|webp)[^\"]*)\"".toRegex()
+        val payloadRegex = "(?s)<script[^>]*>self\\.__next_f\\.push\\((.*?)\\)</script>".toRegex()
+
+        val urls = payloadRegex.findAll(body)
+            .flatMap { payload ->
+                val content = payload.groupValues[1]
+                if (!content.contains(".jpg") && !content.contains(".png") && !content.contains(".webp")) {
+                    return@flatMap emptySequence()
+                }
+                imgUrlRegex.findAll(content)
+                    .map { it.groupValues[1] }
+                    .filter { !it.contains("icon") && (it.contains("chapter") || it.contains("chap")) }
+            }
+            .distinct()
+            .toList()
+
+        return urls.mapIndexed { i, url ->
+            Page(i, imageUrl = url.replace("\\\\", ""))
+        }
+    }
+
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
+
+    // ========================= Helper functions ===========================
+
+    private fun parseMangaListResponse(response: Response): MangasPage {
+        val body = response.body.string()
+        if (body.isBlank()) return MangasPage(emptyList(), false)
+
+        val obj = json.parseToJsonElement(body).jsonObject
+        val data = obj["data"]?.jsonArray ?: return MangasPage(emptyList(), false)
+        val total = obj["total"]?.jsonPrimitive?.intOrNull ?: 0
+
+        val mangas = data.map { el ->
+            val comic = el.jsonObject
+            SManga.create().apply {
+                val id = comic["id"]?.jsonPrimitive?.content ?: ""
+                url = "/comics/$id"
+                title = comic["title"]?.jsonPrimitive?.content ?: ""
+                author = comic["author"]?.jsonPrimitive?.content
+                thumbnail_url = comic["cover_original_url"]?.jsonPrimitive?.content
+                    ?.ifBlank { comic["cover_image"]?.jsonPrimitive?.content }
+                status = when (comic["status"]?.jsonPrimitive?.intOrNull) {
+                    0 -> SManga.ONGOING
+                    1 -> SManga.COMPLETED
+                    else -> SManga.UNKNOWN
+                }
+            }
+        }
+
+        // Show next page if we got a full page and there's more total data
+        val hasNextPage = data.size >= 20 && (mangas.size * 20) < total
+        return MangasPage(mangas, hasNextPage)
+    }
 }
