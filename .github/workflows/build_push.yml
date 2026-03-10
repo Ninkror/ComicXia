@@ -12,7 +12,8 @@ on:
       - '.github/workflows/build_push.yml'
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}
@@ -83,11 +84,10 @@ jobs:
           KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          ./gradlew $MODULES
+          ./gradlew :src:zh:comicxia:assembleDebug
 
       - name: Upload APKs (${{ matrix.chunk.number }})
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        if: "github.repository == 'keiyoushi/extensions-source'"
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
