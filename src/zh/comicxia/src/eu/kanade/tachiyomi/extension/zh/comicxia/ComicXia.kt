@@ -116,7 +116,7 @@ class ComicXia : HttpSource() {
                 val chapterId = chapter["id"]?.jsonPrimitive?.content ?: ""
                 url = "/read/$chapterId"
                 name = chapter["title"]?.jsonPrimitive?.content
-                    ?.removePrefix("NEW").trim()
+                    ?.removePrefix("NEW")?.trim()
                     ?: "Chapter $chapterId"
                 date_upload = 0L
             }
