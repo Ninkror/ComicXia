@@ -40,7 +40,8 @@ internal fun parseMangaList(response: Response, baseUrl: String): MangasPage {
  * - Title: img[alt] attribute.
  */
 internal fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-    setUrlWithoutDomain(element.attr("href"))
+    // Links are already relative paths like /comics/1220 — assign directly
+    url = element.attr("href")
     // img alt is the most reliable title source across both grid-card and list-item layouts
     title = element.selectFirst("img")?.attr("alt")?.trim().orEmpty()
         .ifBlank { element.text().trim() }
@@ -71,7 +72,7 @@ private fun fallbackMangaListParse(body: String): MangasPage {
             if (url.isBlank() || title.length <= 1) return@mapNotNull null
 
             SManga.create().apply {
-                setUrlWithoutDomain(url)
+                this.url = url
                 this.title = title
                 thumbnail_url = img
             }
@@ -139,7 +140,7 @@ internal fun parseChapterList(response: Response, baseUrl: String): List<SChapte
         return elements
             .map { el ->
                 SChapter.create().apply {
-                    setUrlWithoutDomain(el.attr("href"))
+                    url = el.attr("href")
                     name = el.text().trim()
                 }
             }
@@ -157,8 +158,8 @@ internal fun parseChapterList(response: Response, baseUrl: String): List<SChapte
             }
         }
         .distinctBy { it.url }
-        .reversed()
         .toList()
+        .reversed()
 }
 
 // =================================== Pages ====================================
