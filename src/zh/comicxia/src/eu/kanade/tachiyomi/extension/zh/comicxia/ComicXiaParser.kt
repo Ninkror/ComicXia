@@ -12,20 +12,25 @@ import org.jsoup.nodes.Element
 // ================================= Manga List =================================
 
 /**
- * Parses a manga list from [response].
+ * Parses a manga list page into a [MangasPage].
  *
- * The site uses Next.js App Router (SPA). When the server-side-rendered HTML is
- * available (typical Tachiyomi request), JSoup can pick up hydrated `<a>` tags
- * pointing to `/comics/<id>`. Falls back to a regex scan when hydration is absent.
+ * Title source priority (confirmed via DevTools on /rank):
+ *   1. `h3` inside the card (rendered text, always available after hydration)
+ *   2. `img[alt]` attribute fallback
+ *
+ * The "📕等待加载。。。" prefix is a server-side loading placeholder emitted by
+ * Next.js before hydration; it appears in the raw text of some `<a>` tags and must
+ * be stripped. We avoid this entirely by targeting `h3` or `img[alt]` specifically.
  */
 internal fun parseMangaList(response: Response, baseUrl: String): MangasPage {
     val body = response.body.string()
     val document = Jsoup.parse(body, baseUrl)
 
-    // Confirmed selector from live DOM inspection: all manga cards are anchors to /comics/<id>
     val elements = document.select("a[href^=/comics/]")
     if (elements.isNotEmpty()) {
-        val mangas = elements.map { mangaFromElement(it) }.distinctBy { it.url }
+        val mangas = elements.mapNotNull { el ->
+            mangaFromElement(el).takeIf { it.title.isNotBlank() }
+        }.distinctBy { it.url }
         return MangasPage(mangas, mangas.size >= 10)
     }
 
@@ -35,27 +40,34 @@ internal fun parseMangaList(response: Response, baseUrl: String): MangasPage {
 /**
  * Extracts an [SManga] from a manga card [element].
  *
- * Card layout (confirmed via DevTools):
- * - Thumbnail: `img.object-cover` inside the anchor; src is a fully-qualified URL.
- * - Title: img[alt] attribute.
+ * Card DOM (confirmed via DevTools):
+ * ```
+ * <a href="/comics/62881" class="group relative ...">
+ *   <img class="object-cover" src="https://..." />
+ *   <h3 class="font-bold text-white text-sm line-clamp-2">Title</h3>
+ * </a>
+ * ```
+ * Title: prefer `h3` inner text → fallback to `img[alt]`.
+ * Cover: `img.object-cover[src]` (fully-qualified URL, no lazy-loading).
  */
 internal fun mangaFromElement(element: Element): SManga = SManga.create().apply {
-    // Links are already relative paths like /comics/1220 — assign directly
     url = element.attr("href")
-    // img alt is the most reliable title source across both grid-card and list-item layouts
-    title = element.selectFirst("img")?.attr("alt")?.trim().orEmpty()
-        .ifBlank { element.text().trim() }
+    // h3 holds the rendered title — most reliable across all card layouts
+    title = element.selectFirst("h3")?.text()?.trim()
+        ?.ifBlank { element.selectFirst("img")?.attr("alt")?.trim() }
+        .orEmpty()
     thumbnail_url = element.selectFirst("img.object-cover")?.attr("src")
         ?: element.selectFirst("img")?.attr("src")
 }
 
 /**
- * Regex-based fallback for when the page HTML has not been hydrated by Next.js.
- * Scans the raw HTML string for anchor tags pointing to `/comics/<id>` paths.
+ * Regex-based last-resort fallback when JSoup finds no hydrated `<a>` tags.
+ * Scans the raw HTML for `/comics/<id>` anchors and extracts title + cover.
  */
 private fun fallbackMangaListParse(body: String): MangasPage {
     val anchorRegex = "<a[^>]+href=[\"'](/comics/\\d+)[\"'][^>]*>([\\s\\S]*?)</a>".toRegex()
-    val titleRegex = "(?i)alt=[\"']([^\"']+)[\"']".toRegex()
+    val titleRegex = "(?i)<h3[^>]*>([^<]+)</h3>".toRegex()
+    val altRegex = "(?i)alt=[\"']([^\"']+)[\"']".toRegex()
     val imgRegex = "(?i)<img[^>]+src=[\"']([^\"']+)[\"']".toRegex()
 
     val mangas = anchorRegex.findAll(body)
@@ -66,6 +78,7 @@ private fun fallbackMangaListParse(body: String): MangasPage {
             if (innerHtml.contains("更多") || innerHtml.contains("排行榜")) return@mapNotNull null
 
             val title = titleRegex.find(innerHtml)?.groupValues?.get(1)?.trim()
+                ?: altRegex.find(innerHtml)?.groupValues?.get(1)?.trim()
                 ?: innerHtml.replace(Regex("<[^>]+>"), "").trim()
             val img = imgRegex.find(innerHtml)?.groupValues?.get(1)
 
@@ -88,36 +101,27 @@ private fun fallbackMangaListParse(body: String): MangasPage {
 /**
  * Parses full manga details from a dedicated manga page [document].
  *
- * Priority of data sources (confirmed via DevTools):
- * 1. JSON-LD `<script type="application/ld+json">` — most reliable, server-rendered.
- * 2. Open Graph meta tags (`og:description`, `og:image`) — also server-rendered.
- * 3. Inline DOM elements as fallback.
- *
- * Genre links use `a[href*="/categories?"]` (note the `?` before query params).
- * Status is detected by presence of the text "连载中" (ongoing) or "已完结" (completed).
+ * Data sources (server-rendered by Next.js — reliably available):
+ * - `meta[property=og:description]` — synopsis
+ * - `meta[property=og:image]` — cover image
+ * - `a[href*=/categories?]` — genre tags (note `?`, not `/`)
+ * - `h1` — title
+ * - Body text contains "连载中" or "已完结" for status
  */
 internal fun parseMangaDetails(document: Document): SManga = SManga.create().apply {
     title = document.select("h1").firstOrNull()?.text()?.trim() ?: ""
-
-    // Author sits adjacent to the title; no dedicated class but confirmed by DevTools inspection
     author = document.selectFirst("h1 + *")?.text()?.trim()
         ?: document.select("meta[name=author]").attr("content").ifBlank { null }
-
-    // og:description is pre-rendered by Next.js; most robust description source
     description = document.select("meta[property=og:description]").attr("content")
         .ifBlank { document.selectFirst(".line-clamp-3")?.text() }
-
-    // Confirmed selector from DevTools: genre tags link to /categories? (with query string)
+    // Confirmed selector: genre links use /categories? (with query-string, not path segment)
     genre = document.select("a[href*=/categories?]").joinToString { it.text().trim() }
-
     val pageText = document.text()
     status = when {
         pageText.contains("连载中") -> SManga.ONGOING
         pageText.contains("已完结") -> SManga.COMPLETED
         else -> SManga.UNKNOWN
     }
-
-    // og:image is server-rendered — preferred over DOM img for reliability
     thumbnail_url = document.select("meta[property=og:image]").attr("content")
         .ifBlank { document.selectFirst("img.object-cover")?.attr("src") }
 }
@@ -127,49 +131,62 @@ internal fun parseMangaDetails(document: Document): SManga = SManga.create().app
 /**
  * Parses a list of [SChapter] from [response].
  *
- * IMPORTANT: Chapter links use `/read/<id>` format (confirmed via DevTools),
- * NOT `/chapters/` as originally assumed.
+ * Key findings from DevTools:
+ * - Chapter links use `/read/<id>` (NOT `/chapters/`)
+ * - The page initially shows only ~5 chapters; a "查看全部" / "展开全部" button
+ *   controls the rest — but in the static HTML served to Tachiyomi (no JS),
+ *   all chapter `<a>` tags may still be present in the DOM (just hidden by CSS).
+ *   We select ALL of them regardless.
+ * - The page lists chapters NEWEST FIRST (descending), which is what Tachiyomi
+ *   expects — so no reversal is needed.
+ * - Latest chapters have a `<span>NEW</span>` badge; strip it from the name.
  */
 internal fun parseChapterList(response: Response, baseUrl: String): List<SChapter> {
     val body = response.body.string()
     val document = Jsoup.parse(body, baseUrl)
 
-    // Confirmed selector: chapter links use /read/<id> prefix
     val elements = document.select("a[href^=/read/]")
     if (elements.isNotEmpty()) {
         return elements
-            .map { el ->
-                SChapter.create().apply {
-                    url = el.attr("href")
-                    name = el.text().trim()
-                }
-            }
+            .map { el -> chapterFromElement(el) }
             .distinctBy { it.url }
-            .reversed()
     }
 
-    // Regex fallback for un-hydrated HTML
+    // Regex fallback
     val chapterRegex = "href=[\"'](/read/\\d+)[\"'][^>]*>([\\s\\S]*?)</a>".toRegex()
     return chapterRegex.findAll(body)
         .map { match ->
             SChapter.create().apply {
                 url = match.groupValues[1]
-                name = match.groupValues[2].replace(Regex("<[^>]+>"), "").trim()
+                name = cleanChapterName(match.groupValues[2].replace(Regex("<[^>]+>"), ""))
             }
         }
         .distinctBy { it.url }
         .toList()
-        .reversed()
 }
+
+/** Extracts a [SChapter] from a chapter list [element]. */
+private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
+    url = element.attr("href")
+    // Remove the NEW badge span text and clean up whitespace
+    name = cleanChapterName(element.text())
+}
+
+/**
+ * Strips the "NEW" badge and any surrounding whitespace from a chapter name.
+ * Example input:  "NEW第60话"  →  output: "第60话"
+ */
+private fun cleanChapterName(raw: String): String =
+    raw.replace(Regex("^NEW\\s*", RegexOption.IGNORE_CASE), "").trim()
 
 // =================================== Pages ====================================
 
 /**
  * Parses [Page] image URLs from a chapter reader [response].
  *
- * Strategy 1: JSoup — look for `<img>` tags whose src contains `/chapter/`.
- * Strategy 2: Regex — scan inline Next.js `self.__next_f.push(...)` JSON payloads
- *             for image URLs (jpg/png/webp) that reference `/chapter/`.
+ * Strategy 1: JSoup — `<img>` tags whose src/data-src path contains `/chapter/`.
+ * Strategy 2: Regex — scan Next.js `self.__next_f.push(...)` JSON payloads for
+ *             image URLs (jpg/png/webp) referencing chapter images.
  */
 internal fun parsePageList(response: Response): List<Page> {
     val body = response.body.string()

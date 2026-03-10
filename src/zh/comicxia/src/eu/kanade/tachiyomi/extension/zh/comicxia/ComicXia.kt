@@ -50,8 +50,9 @@ class ComicXia : ParsedHttpSource() {
 
     // =============================== Search ===============================
 
+    // Browser confirmed: the search page uses `q` as the keyword param (not `keyword`)
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request =
-        GET("$baseUrl/search?keyword=$query&page=$page", headers)
+        GET("$baseUrl/search?q=$query&page=$page", headers)
 
     override fun searchMangaParse(response: Response): MangasPage = parseMangaList(response, baseUrl)
 
