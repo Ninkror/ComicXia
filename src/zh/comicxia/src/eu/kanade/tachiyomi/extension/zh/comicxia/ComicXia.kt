@@ -69,13 +69,36 @@ class ComicXia : HttpSource() {
 
     // =============================== Search ===============================
 
+    override fun getFilterList() = FilterList(
+        SortFilter(),
+        StatusFilter(),
+        CategoryFilter(),
+        RegionFilter(),
+    )
+
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val q = query.trim()
         if (q.startsWith(ID_SEARCH_PREFIX)) {
             val id = q.removePrefix(ID_SEARCH_PREFIX)
             return GET("$apiBase/comics/$id", headers)
         }
-        return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
+        
+        if (q.isNotEmpty()) {
+            return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
+        }
+
+        // Apply filters
+        var url = "$apiBase/comics?page=$page&limit=20"
+        for (filter in filters) {
+            when (filter) {
+                is SortFilter -> url += "&sort=${filter.toUriPart()}"
+                is StatusFilter -> if (filter.state != 0) url += "&status=${filter.toUriPart()}"
+                is CategoryFilter -> if (filter.state != 0) url += "&category=${filter.toUriPart()}"
+                is RegionFilter -> if (filter.state != 0) url += "&region=${filter.toUriPart()}"
+                else -> {}
+            }
+        }
+        return GET(url, headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
@@ -290,6 +313,76 @@ class ComicXia : HttpSource() {
         val hasNextPage = data.size >= 20 && mangas.size < total
         return MangasPage(mangas, hasNextPage)
     }
+
+    // ============================== Filters ===============================
+
+    private open class UriPartFilter(
+        displayName: String,
+        val vals: Array<Pair<String, String>>,
+        state: Int = 0,
+    ) : Filter.Select<String>(displayName, vals.map { it.first }.toTypedArray(), state) {
+        fun toUriPart() = vals[state].second
+    }
+
+    private class SortFilter : UriPartFilter(
+        "排序",
+        arrayOf(
+            Pair("最新更新", "updated_at"),
+            Pair("最多点击", "view"),
+        ),
+        state = 0,
+    )
+
+    private class StatusFilter : UriPartFilter(
+        "状态",
+        arrayOf(
+            Pair("全部", ""),
+            Pair("连载中", "1"),
+            Pair("已完结", "2"),
+        ),
+        state = 0,
+    )
+
+    private class CategoryFilter : UriPartFilter(
+        "分类",
+        arrayOf(
+            Pair("全部", ""),
+            Pair("后宫", "29"),
+            Pair("百合", "20"),
+            Pair("BL", "2"),
+            Pair("霸总", "18"),
+            Pair("彩虹", "30"),
+            Pair("都市", "11"),
+            Pair("动作", "6"),
+            Pair("搞笑", "10"),
+            Pair("古风", "12"),
+            Pair("奇幻", "7"),
+            Pair("日常", "15"),
+            Pair("生活", "17"),
+            Pair("同人", "19"),
+            Pair("悬疑", "14"),
+            Pair("玄幻", "9"),
+            Pair("校园", "16"),
+            Pair("恋爱", "8"),
+            Pair("剧情", "1"),
+            Pair("冒险", "4"),
+            Pair("穿越", "13"),
+            Pair("女性向", "6"),
+        ),
+        state = 0,
+    )
+
+    private class RegionFilter : UriPartFilter(
+        "地区",
+        arrayOf(
+            Pair("全部", ""),
+            Pair("韩漫", "1"),
+            Pair("日漫", "2"),
+            Pair("国漫", "3"),
+            Pair("美漫", "4"),
+        ),
+        state = 0,
+    )
 
     companion object {
         const val ID_SEARCH_PREFIX = "id:"
