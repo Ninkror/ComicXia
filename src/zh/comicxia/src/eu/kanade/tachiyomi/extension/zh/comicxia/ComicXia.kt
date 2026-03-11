@@ -82,6 +82,8 @@ class ComicXia : HttpSource() {
         if (response.request.url.pathSegments.last() != "comics") {
             // It was an ID search request which routes to details endpoint
             val manga = try {
+                // mangaDetailsParse relies on manga.url to extract the ID if needed, 
+                // but our API returns the full object here. We just pass it through.
                 mangaDetailsParse(response)
             } catch (e: Exception) {
                 return MangasPage(emptyList(), false)
@@ -198,25 +200,34 @@ class ComicXia : HttpSource() {
         }
 
         // Strategy 2: scan Next.js RSC payload or raw HTML for image URLs
-        // The HTML contains JSON arrays with heavily escaped strings like "https:\/\/mwfimsvfast...jpg"
-        // We clean the slashes and quotes first to make regex matching trivial and robust.
         val cleanBody = body.replace("\\\"", "\"").replace("\\/", "/")
-        
-        // Match any absolute URL ending in an image extension
         val imgUrlRegex = "(https?://[^\"]+?(?:jpg|jpeg|png|webp))".toRegex(RegexOption.IGNORE_CASE)
-        
-        val validUrls = imgUrlRegex.findAll(cleanBody)
-            .map { it.groupValues[1] }
-            .filter { url ->
-                val lower = url.lowercase()
-                !lower.contains("icon") && 
-                !lower.contains("cover") && 
-                !lower.contains("avatar") && 
-                !lower.contains("logo") &&
-                (lower.contains("chapter") || lower.contains("chap") || lower.contains("book") || lower.contains("mwfimsvfast") || lower.contains("upload"))
-            }
-            .distinct()
-            .toList()
+        val allUrls = imgUrlRegex.findAll(cleanBody).map { it.groupValues[1] }.toList()
+
+        // Count occurrences of each domain to find the primary image CDN
+        val domainRegex = "https?://([^/]+)".toRegex(RegexOption.IGNORE_CASE)
+        val domainCounts = allUrls.mapNotNull { domainRegex.find(it)?.groupValues?.get(1) }
+            .groupingBy { it }.eachCount()
+
+        // Find the most frequent domain that looks like a CDN (mw/static/upload/img)
+        var targetDomain = domainCounts.entries
+            .sortedByDescending { it.value }
+            .firstOrNull { it.key.contains("mw") || it.key.contains("static") || it.key.contains("upload") || it.key.contains("img") }
+            ?.key
+
+        // Fallback to the absolute most common domain if none matched the CDN keywords
+        if (targetDomain == null) {
+            targetDomain = domainCounts.maxByOrNull { it.value }?.key ?: ""
+        }
+
+        val validUrls = allUrls.filter { url ->
+            val lower = url.lowercase()
+            lower.contains(targetDomain) &&
+                !lower.contains("icon") &&
+                !lower.contains("cover") &&
+                !lower.contains("avatar") &&
+                !lower.contains("logo")
+        }.distinct()
 
         return validUrls.mapIndexed { i, url ->
             Page(i, imageUrl = url)
