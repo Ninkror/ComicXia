@@ -18,17 +18,16 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 
 /**
- * ComicXia extension — uses the internal REST API (`/api/v1/...`) rather than
- * HTML parsing, because the site is a Next.js SPA that ships zero comic DOM
- * in its server-rendered HTML.
+ * ComicXia extension — uses the internal REST API (`/api/v1/...`).
+ * The site is a Next.js SPA that ships zero comic HTML in server-rendered pages.
  *
  * Confirmed API structure (2026-03-11):
- *   GET /api/v1/comics?sort=view&page=N       → popular
- *   GET /api/v1/comics?sort=updated&page=N    → latest
- *   GET /api/v1/comics?q=QUERY&page=N         → search (TODO: verify param)
- *   GET /api/v1/comics/{id}                   → manga details
- *   GET /api/v1/comics/{id}/chapters?page=1&limit=500 → chapter list
- *   GET /read/{chapterId}                     → reader page (parse images from JS payload)
+ *   GET /api/v1/comics?sort=view&page=N           → popular
+ *   GET /api/v1/comics?sort=updated&page=N        → latest
+ *   GET /api/v1/comics?keyword=QUERY&page=N       → search  (NOT ?q=)
+ *   GET /api/v1/comics/{id}                       → manga details
+ *   GET /api/v1/comics/{id}/chapters?page=N&limit=50 → chapter list (paginated, max 50/page)
+ *   GET /read/{chapterId}                         → reader page (images via Next.js payload)
  */
 class ComicXia : HttpSource() {
 
@@ -38,6 +37,9 @@ class ComicXia : HttpSource() {
     override val supportsLatest = true
 
     private val apiBase = "$baseUrl/api/v1"
+
+    // Chapter page size confirmed by API: returns max 50 per page regardless of `limit`
+    private val chapterPageSize = 50
 
     override fun headersBuilder(): Headers.Builder = super.headersBuilder()
         .add("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
@@ -64,31 +66,40 @@ class ComicXia : HttpSource() {
 
     // =============================== Search ===============================
 
+    // FIX: confirmed param is `keyword=` (not `q=`).
+    // `?q=` ignores the value and returns top-by-view results (same as Popular).
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request =
-        GET("$apiBase/comics?q=${query.trim()}&page=$page&limit=20", headers)
+        GET("$apiBase/comics?keyword=${query.trim()}&page=$page&limit=20", headers)
 
     override fun searchMangaParse(response: Response): MangasPage =
         parseMangaListResponse(response)
 
     // =========================== Manga Details ============================
 
-    /**
-     * The comic URL is stored as `/comics/{id}`, so we strip the path to get the ID.
-     * Then we call /api/v1/comics/{id} for full details.
-     */
     override fun mangaDetailsRequest(manga: SManga): Request {
         val id = manga.url.removePrefix("/comics/").trimEnd('/')
         return GET("$apiBase/comics/$id", headers)
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val obj = json.parseToJsonElement(response.body.string()).jsonObject
+        // API wraps everything under a "data" key
+        val root = json.parseToJsonElement(response.body.string()).jsonObject
+        val obj = root["data"]?.jsonObject ?: root  // handle both wrapped and unwrapped
+
+        // FIX: combine category (e.g. "禁漫"), region (e.g. "日漫"), and tags array
+        // into the genre field — previously only `tags` was used, losing category info.
+        val categoryName = obj["category"]?.jsonPrimitive?.content
+        val regionName = obj["region"]?.jsonPrimitive?.content
+        val tagsList = obj["tags"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+        val allGenres = listOfNotNull(categoryName, regionName) + tagsList
+
         return SManga.create().apply {
-            url = "/comics/${obj["id"]?.jsonPrimitive?.content}"
+            val id = obj["id"]?.jsonPrimitive?.content ?: ""
+            url = "/comics/$id"
             title = obj["title"]?.jsonPrimitive?.content ?: ""
             author = obj["author"]?.jsonPrimitive?.content
             description = obj["description"]?.jsonPrimitive?.content
-            genre = obj["tags"]?.jsonArray?.joinToString { it.jsonPrimitive.content }
+            genre = allGenres.joinToString()
             status = when (obj["status"]?.jsonPrimitive?.intOrNull) {
                 0 -> SManga.ONGOING
                 1 -> SManga.COMPLETED
@@ -103,25 +114,52 @@ class ComicXia : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val id = manga.url.removePrefix("/comics/").trimEnd('/')
-        return GET("$apiBase/comics/$id/chapters?page=1&limit=500", headers)
+        // FIX: API enforces max 50 items per page regardless of limit param.
+        // We start at page 1; fetchAllChapters() loops through remaining pages.
+        return GET("$apiBase/comics/$id/chapters?page=1&limit=$chapterPageSize", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
-        val obj = json.parseToJsonElement(response.body.string()).jsonObject
-        val data = obj["data"]?.jsonArray ?: return emptyList()
+        val body = response.body.string()
+        val root = json.parseToJsonElement(body).jsonObject
+        val data = root["data"]?.jsonArray ?: return emptyList()
+        val total = root["total"]?.jsonPrimitive?.intOrNull ?: data.size
 
-        return data.map { el ->
-            val chapter = el.jsonObject
-            SChapter.create().apply {
-                val chapterId = chapter["id"]?.jsonPrimitive?.content ?: ""
-                url = "/read/$chapterId"
-                name = chapter["title"]?.jsonPrimitive?.content
-                    ?.removePrefix("NEW")?.trim()
-                    ?: "Chapter $chapterId"
-                date_upload = 0L
+        // Collect first page
+        val chapters = mutableListOf<SChapter>()
+        chapters.addAll(data.map { chapterFromJson(it.jsonObject) })
+
+        // FIX: fetch remaining pages if total > one page worth of chapters
+        val pageCount = (total + chapterPageSize - 1) / chapterPageSize
+        if (pageCount > 1) {
+            val mangaId = response.request.url.pathSegments
+                .dropLast(1) // drop "chapters"
+                .last()
+
+            for (page in 2..pageCount) {
+                val pageResponse = client.newCall(
+                    GET("$apiBase/comics/$mangaId/chapters?page=$page&limit=$chapterPageSize", headers),
+                ).execute()
+                val pageRoot = json.parseToJsonElement(pageResponse.body.string()).jsonObject
+                pageRoot["data"]?.jsonArray?.forEach {
+                    chapters.add(chapterFromJson(it.jsonObject))
+                }
             }
-        }.reversed() // API returns oldest-first; reverse for newest-first display
+        }
+
+        // API returns oldest-first (chapter_number ascending); reverse for newest-first display
+        return chapters.reversed()
     }
+
+    private fun chapterFromJson(chapter: kotlinx.serialization.json.JsonObject): SChapter =
+        SChapter.create().apply {
+            val chapterId = chapter["id"]?.jsonPrimitive?.content ?: ""
+            url = "/read/$chapterId"
+            name = chapter["title"]?.jsonPrimitive?.content
+                ?.removePrefix("NEW")?.trim()
+                ?: "Chapter $chapterId"
+            date_upload = 0L
+        }
 
     // =============================== Pages ================================
 
@@ -166,7 +204,7 @@ class ComicXia : HttpSource() {
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
 
-    // ========================= Helper functions ===========================
+    // ========================= Helpers ====================================
 
     private fun parseMangaListResponse(response: Response): MangasPage {
         val body = response.body.string()
@@ -193,8 +231,7 @@ class ComicXia : HttpSource() {
             }
         }
 
-        // Show next page if we got a full page and there's more total data
-        val hasNextPage = data.size >= 20 && (mangas.size * 20) < total
+        val hasNextPage = data.size >= 20 && mangas.size < total
         return MangasPage(mangas, hasNextPage)
     }
 }
