@@ -14,11 +14,17 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.floatOrNull
 import okhttp3.Headers
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import java.text.SimpleDateFormat
 import java.util.Locale
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * ComicXia extension — uses the internal REST API (`/api/v1/...`).
@@ -51,6 +57,38 @@ class ComicXia : HttpSource() {
 
     private val json = Json { ignoreUnknownKeys = true }
 
+    override val client = network.client.newBuilder()
+        .addInterceptor(::imageIntercept)
+        .build()
+
+    private fun imageIntercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        
+        val fragment = request.url.fragment
+        if (fragment != null && fragment.contains("key=") && fragment.contains("iv=")) {
+            val key = fragment.substringAfter("key=").substringBefore("&")
+            val iv = fragment.substringAfter("iv=").substringBefore("&")
+            
+            if (key.isNotEmpty() && iv.isNotEmpty() && response.isSuccessful) {
+                try {
+                    val encrypted = response.body.bytes()
+                    val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+                    val keySpec = SecretKeySpec(key.toByteArray(), "AES")
+                    val ivSpec = IvParameterSpec(iv.toByteArray())
+                    cipher.init(Cipher.DECRYPT_MODE, keySpec, ivSpec)
+                    val decrypted = cipher.doFinal(encrypted)
+                    
+                    val newBody = decrypted.toResponseBody(response.body.contentType())
+                    return response.newBuilder().body(newBody).build()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+        return response
+    }
+
     // ============================== Popular ===============================
 
     override fun popularMangaRequest(page: Int): Request =
@@ -72,17 +110,14 @@ class ComicXia : HttpSource() {
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val q = query.trim()
         if (q.startsWith(ID_SEARCH_PREFIX)) {
-            val id = q.removePrefix(ID_SEARCH_PREFIX).trim()
-            return GET(
-                "$apiBase/comics/$id",
-                headers.newBuilder().add("is-id-search", "true").build()
-            )
+            val id = q.removePrefix(ID_SEARCH_PREFIX)
+            return GET("$apiBase/comics/$id", headers)
         }
         return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        if (response.request.header("is-id-search") != null) {
+        if (response.request.url.pathSegments.last() != "comics") {
             // It was an ID search request which routes to details endpoint
             val manga = try {
                 mangaDetailsParse(response)
@@ -200,29 +235,27 @@ class ComicXia : HttpSource() {
             }
         }
 
-        // Strategy 2: scan Next.js RSC payload or raw HTML for image URLs
-        // The HTML contains JSON arrays with heavily escaped strings like "https:\/\/mwfimsvfast...jpg"
-        // We clean the slashes and quotes first to make regex matching trivial and robust.
+        // Strategy 2: Extract Next.js payload AES setup and image URLs
         val cleanBody = body.replace("\\\"", "\"").replace("\\/", "/")
         
-        // Match any absolute URL ending in an image extension
-        val imgUrlRegex = "(https?://[^\"]+?(?:jpg|jpeg|png|webp))".toRegex(RegexOption.IGNORE_CASE)
+        val keyMatch = Regex(""""key":"([^"]+)"""").find(cleanBody)
+        val ivMatch = Regex(""""iv":"([^"]+)"""").find(cleanBody)
         
-        val validUrls = imgUrlRegex.findAll(cleanBody)
+        val key = keyMatch?.groupValues?.get(1)
+        val iv = ivMatch?.groupValues?.get(1)
+
+        val urls = Regex(""""original_url":"([^"]+)"""").findAll(cleanBody)
             .map { it.groupValues[1] }
-            .filter { url ->
-                val lower = url.lowercase()
-                !lower.contains("icon") && 
-                !lower.contains("cover") && 
-                !lower.contains("avatar") && 
-                !lower.contains("logo") &&
-                (lower.contains("chapter") || lower.contains("chap") || lower.contains("book") || lower.contains("mwfimsvfast") || lower.contains("upload"))
-            }
             .distinct()
             .toList()
 
-        return validUrls.mapIndexed { i, url ->
-            Page(i, imageUrl = url)
+        return urls.mapIndexed { i, url ->
+            val finalUrl = if (key != null && iv != null) {
+                "$url#key=$key&iv=$iv"
+            } else {
+                url
+            }
+            Page(i, imageUrl = finalUrl)
         }
     }
 
