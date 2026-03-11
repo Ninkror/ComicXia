@@ -69,44 +69,22 @@ class ComicXia : HttpSource() {
 
     // =============================== Search ===============================
 
-    override fun getFilterList() = FilterList(
-        SortFilter(),
-        StatusFilter(),
-        CategoryFilter(),
-        RegionFilter(),
-    )
-
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val q = query.trim()
         if (q.startsWith(ID_SEARCH_PREFIX)) {
-            val id = q.removePrefix(ID_SEARCH_PREFIX)
-            return GET("$apiBase/comics/$id", headers)
+            val id = q.removePrefix(ID_SEARCH_PREFIX).trim()
+            return GET(
+                "$apiBase/comics/$id",
+                headers.newBuilder().add("is-id-search", "true").build()
+            )
         }
-        
-        if (q.isNotEmpty()) {
-            return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
-        }
-
-        // Apply filters
-        var url = "$apiBase/comics?page=$page&limit=20"
-        for (filter in filters) {
-            when (filter) {
-                is SortFilter -> url += "&sort=${filter.toUriPart()}"
-                is StatusFilter -> if (filter.state != 0) url += "&status=${filter.toUriPart()}"
-                is CategoryFilter -> if (filter.state != 0) url += "&category=${filter.toUriPart()}"
-                is RegionFilter -> if (filter.state != 0) url += "&region=${filter.toUriPart()}"
-                else -> {}
-            }
-        }
-        return GET(url, headers)
+        return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        if (response.request.url.pathSegments.last() != "comics") {
+        if (response.request.header("is-id-search") != null) {
             // It was an ID search request which routes to details endpoint
             val manga = try {
-                // mangaDetailsParse relies on manga.url to extract the ID if needed, 
-                // but our API returns the full object here. We just pass it through.
                 mangaDetailsParse(response)
             } catch (e: Exception) {
                 return MangasPage(emptyList(), false)
@@ -223,34 +201,25 @@ class ComicXia : HttpSource() {
         }
 
         // Strategy 2: scan Next.js RSC payload or raw HTML for image URLs
+        // The HTML contains JSON arrays with heavily escaped strings like "https:\/\/mwfimsvfast...jpg"
+        // We clean the slashes and quotes first to make regex matching trivial and robust.
         val cleanBody = body.replace("\\\"", "\"").replace("\\/", "/")
+        
+        // Match any absolute URL ending in an image extension
         val imgUrlRegex = "(https?://[^\"]+?(?:jpg|jpeg|png|webp))".toRegex(RegexOption.IGNORE_CASE)
-        val allUrls = imgUrlRegex.findAll(cleanBody).map { it.groupValues[1] }.toList()
-
-        // Count occurrences of each domain to find the primary image CDN
-        val domainRegex = "https?://([^/]+)".toRegex(RegexOption.IGNORE_CASE)
-        val domainCounts = allUrls.mapNotNull { domainRegex.find(it)?.groupValues?.get(1) }
-            .groupingBy { it }.eachCount()
-
-        // Find the most frequent domain that looks like a CDN (mw/static/upload/img)
-        var targetDomain = domainCounts.entries
-            .sortedByDescending { it.value }
-            .firstOrNull { it.key.contains("mw") || it.key.contains("static") || it.key.contains("upload") || it.key.contains("img") }
-            ?.key
-
-        // Fallback to the absolute most common domain if none matched the CDN keywords
-        if (targetDomain == null) {
-            targetDomain = domainCounts.maxByOrNull { it.value }?.key ?: ""
-        }
-
-        val validUrls = allUrls.filter { url ->
-            val lower = url.lowercase()
-            lower.contains(targetDomain) &&
-                !lower.contains("icon") &&
-                !lower.contains("cover") &&
-                !lower.contains("avatar") &&
-                !lower.contains("logo")
-        }.distinct()
+        
+        val validUrls = imgUrlRegex.findAll(cleanBody)
+            .map { it.groupValues[1] }
+            .filter { url ->
+                val lower = url.lowercase()
+                !lower.contains("icon") && 
+                !lower.contains("cover") && 
+                !lower.contains("avatar") && 
+                !lower.contains("logo") &&
+                (lower.contains("chapter") || lower.contains("chap") || lower.contains("book") || lower.contains("mwfimsvfast") || lower.contains("upload"))
+            }
+            .distinct()
+            .toList()
 
         return validUrls.mapIndexed { i, url ->
             Page(i, imageUrl = url)
@@ -313,76 +282,6 @@ class ComicXia : HttpSource() {
         val hasNextPage = data.size >= 20 && mangas.size < total
         return MangasPage(mangas, hasNextPage)
     }
-
-    // ============================== Filters ===============================
-
-    private open class UriPartFilter(
-        displayName: String,
-        val vals: Array<Pair<String, String>>,
-        state: Int = 0,
-    ) : Filter.Select<String>(displayName, vals.map { it.first }.toTypedArray(), state) {
-        fun toUriPart() = vals[state].second
-    }
-
-    private class SortFilter : UriPartFilter(
-        "排序",
-        arrayOf(
-            Pair("最新更新", "updated_at"),
-            Pair("最多点击", "view"),
-        ),
-        state = 0,
-    )
-
-    private class StatusFilter : UriPartFilter(
-        "状态",
-        arrayOf(
-            Pair("全部", ""),
-            Pair("连载中", "1"),
-            Pair("已完结", "2"),
-        ),
-        state = 0,
-    )
-
-    private class CategoryFilter : UriPartFilter(
-        "分类",
-        arrayOf(
-            Pair("全部", ""),
-            Pair("后宫", "29"),
-            Pair("百合", "20"),
-            Pair("BL", "2"),
-            Pair("霸总", "18"),
-            Pair("彩虹", "30"),
-            Pair("都市", "11"),
-            Pair("动作", "6"),
-            Pair("搞笑", "10"),
-            Pair("古风", "12"),
-            Pair("奇幻", "7"),
-            Pair("日常", "15"),
-            Pair("生活", "17"),
-            Pair("同人", "19"),
-            Pair("悬疑", "14"),
-            Pair("玄幻", "9"),
-            Pair("校园", "16"),
-            Pair("恋爱", "8"),
-            Pair("剧情", "1"),
-            Pair("冒险", "4"),
-            Pair("穿越", "13"),
-            Pair("女性向", "6"),
-        ),
-        state = 0,
-    )
-
-    private class RegionFilter : UriPartFilter(
-        "地区",
-        arrayOf(
-            Pair("全部", ""),
-            Pair("韩漫", "1"),
-            Pair("日漫", "2"),
-            Pair("国漫", "3"),
-            Pair("美漫", "4"),
-        ),
-        state = 0,
-    )
 
     companion object {
         const val ID_SEARCH_PREFIX = "id:"
