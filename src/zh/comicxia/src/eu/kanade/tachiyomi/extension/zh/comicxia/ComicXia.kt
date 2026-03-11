@@ -213,18 +213,23 @@ class ComicXia : HttpSource() {
     // ========================= Helpers ====================================
 
     /**
-     * Parses the date portion of an ISO-8601 datetime string.
-     * Example input: "2025-11-29T02:36:51.910327+08:00" → uses only "2025-11-29"
+     * Parses a full ISO-8601 datetime string with timezone.
+     * Example: "2025-11-29T02:36:51.910327+08:00"
      *
-     * Parsing only the date (not time/timezone) avoids all Android version compatibility
-     * issues with timezone formats in SimpleDateFormat.
+     * Step 1: normalize to "2025-11-29T02:36:51+0800"
+     *   - take first 19 chars (drop sub-seconds)
+     *   - take last 6 chars of original, remove colon (+08:00 → +0800)
+     * Step 2: parse with "yyyy-MM-dd'T'HH:mm:ssZ"
      */
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US)
 
+    @Synchronized
     private fun parseDate(dateStr: String?): Long {
-        if (dateStr.isNullOrBlank() || dateStr.length < 10) return 0L
+        if (dateStr.isNullOrBlank() || dateStr.length < 19) return 0L
         return try {
-            dateFormat.parse(dateStr.substring(0, 10))?.time ?: 0L
+            val datePart = dateStr.substring(0, 19)       // "2025-11-29T02:36:51"
+            val tzPart = dateStr.takeLast(6).replace(":", "") // "+08:00" → "+0800"
+            dateFormat.parse("$datePart$tzPart")?.time ?: 0L
         } catch (e: Exception) {
             0L
         }
