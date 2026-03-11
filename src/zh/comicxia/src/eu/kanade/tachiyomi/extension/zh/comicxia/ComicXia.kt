@@ -68,13 +68,27 @@ class ComicXia : HttpSource() {
 
     // =============================== Search ===============================
 
-    // FIX: confirmed param is `keyword=` (not `q=`).
-    // `?q=` ignores the value and returns top-by-view results (same as Popular).
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request =
-        GET("$apiBase/comics?keyword=${query.trim()}&page=$page&limit=20", headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val q = query.trim()
+        if (q.startsWith(ID_SEARCH_PREFIX)) {
+            val id = q.removePrefix(ID_SEARCH_PREFIX)
+            return GET("$apiBase/comics/$id", headers)
+        }
+        return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
+    }
 
-    override fun searchMangaParse(response: Response): MangasPage =
-        parseMangaListResponse(response)
+    override fun searchMangaParse(response: Response): MangasPage {
+        if (response.request.url.pathSegments.last() != "comics") {
+            // It was an ID search request which routes to details endpoint
+            val manga = try {
+                mangaDetailsParse(response)
+            } catch (e: Exception) {
+                return MangasPage(emptyList(), false)
+            }
+            return MangasPage(listOf(manga), false)
+        }
+        return parseMangaListResponse(response)
+    }
 
     // =========================== Manga Details ============================
 
@@ -160,17 +174,13 @@ class ComicXia : HttpSource() {
             name = chapter["title"]?.jsonPrimitive?.content
                 ?.removePrefix("NEW")?.trim()
                 ?: "Chapter $chapterId"
+            chapter_number = chapter["chapter_number"]?.jsonPrimitive?.floatOrNull ?: -1f
             // Prefer updated_at; fall back to created_at
             date_upload = parseDate(
                 chapter["updated_at"]?.jsonPrimitive?.content
                     ?: chapter["created_at"]?.jsonPrimitive?.content,
             )
         }
-
-    // =============================== Pages ================================
-
-    override fun pageListRequest(chapter: SChapter): Request =
-        GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val body = response.body.string()
@@ -186,25 +196,29 @@ class ComicXia : HttpSource() {
             }
         }
 
-        // Strategy 2: scan Next.js RSC payload for image URLs
-        val imgUrlRegex = "\"(https?://[^\"]*(?:jpg|jpeg|png|webp)[^\"]*)\"".toRegex()
-        val payloadRegex = "(?s)<script[^>]*>self\\.__next_f\\.push\\((.*?)\\)</script>".toRegex()
-
-        val urls = payloadRegex.findAll(body)
-            .flatMap { payload ->
-                val content = payload.groupValues[1]
-                if (!content.contains(".jpg") && !content.contains(".png") && !content.contains(".webp")) {
-                    return@flatMap emptySequence()
-                }
-                imgUrlRegex.findAll(content)
-                    .map { it.groupValues[1] }
-                    .filter { !it.contains("icon") && (it.contains("chapter") || it.contains("chap")) }
+        // Strategy 2: scan Next.js RSC payload or raw HTML for image URLs
+        // The HTML contains JSON arrays with heavily escaped strings like "https:\/\/mwfimsvfast...jpg"
+        // We clean the slashes and quotes first to make regex matching trivial and robust.
+        val cleanBody = body.replace("\\\"", "\"").replace("\\/", "/")
+        
+        // Match any absolute URL ending in an image extension
+        val imgUrlRegex = "(https?://[^\"]+?(?:jpg|jpeg|png|webp))".toRegex(RegexOption.IGNORE_CASE)
+        
+        val validUrls = imgUrlRegex.findAll(cleanBody)
+            .map { it.groupValues[1] }
+            .filter { url ->
+                val lower = url.lowercase()
+                !lower.contains("icon") && 
+                !lower.contains("cover") && 
+                !lower.contains("avatar") && 
+                !lower.contains("logo") &&
+                (lower.contains("chapter") || lower.contains("chap") || lower.contains("book") || lower.contains("mwfimsvfast") || lower.contains("upload"))
             }
             .distinct()
             .toList()
 
-        return urls.mapIndexed { i, url ->
-            Page(i, imageUrl = url.replace("\\\\", ""))
+        return validUrls.mapIndexed { i, url ->
+            Page(i, imageUrl = url)
         }
     }
 
@@ -263,5 +277,9 @@ class ComicXia : HttpSource() {
 
         val hasNextPage = data.size >= 20 && mangas.size < total
         return MangasPage(mangas, hasNextPage)
+    }
+
+    companion object {
+        const val ID_SEARCH_PREFIX = "id:"
     }
 }
