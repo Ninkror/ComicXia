@@ -44,7 +44,7 @@ import javax.crypto.spec.SecretKeySpec
  */
 class ComicXia : HttpSource(), ConfigurableSource {
 
-    override val name = "ComicXia"
+    override val name = "漫画侠"
     override val baseUrl = "https://www.comicxia.com"
     override val lang = "zh"
     override val supportsLatest = true
