@@ -21,6 +21,7 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.Jsoup
 import java.text.SimpleDateFormat
@@ -259,7 +260,7 @@ class ComicXia : HttpSource(), ConfigurableSource {
         return urls.mapIndexed { i, url ->
             // Replace host dynamically based on user setting
             val modifiedUrl = try {
-                val httpUrl = okhttp3.HttpUrl.parse(url)
+                val httpUrl = url.toHttpUrlOrNull()
                 if (httpUrl != null) {
                     httpUrl.newBuilder().host(hostPref).build().toString()
                 } else url
