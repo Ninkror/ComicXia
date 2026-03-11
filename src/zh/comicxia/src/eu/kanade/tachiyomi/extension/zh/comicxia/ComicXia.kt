@@ -16,6 +16,8 @@ import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * ComicXia extension — uses the internal REST API (`/api/v1/...`).
@@ -129,7 +131,7 @@ class ComicXia : HttpSource() {
         val chapters = mutableListOf<SChapter>()
         chapters.addAll(data.map { chapterFromJson(it.jsonObject) })
 
-        // FIX: fetch remaining pages if total > one page worth of chapters
+        // Fetch remaining pages if total > one page worth of chapters
         val pageCount = (total + chapterPageSize - 1) / chapterPageSize
         if (pageCount > 1) {
             val mangaId = response.request.url.pathSegments
@@ -158,7 +160,11 @@ class ComicXia : HttpSource() {
             name = chapter["title"]?.jsonPrimitive?.content
                 ?.removePrefix("NEW")?.trim()
                 ?: "Chapter $chapterId"
-            date_upload = 0L
+            // Prefer updated_at; fall back to created_at
+            date_upload = parseDate(
+                chapter["updated_at"]?.jsonPrimitive?.content
+                    ?: chapter["created_at"]?.jsonPrimitive?.content,
+            )
         }
 
     // =============================== Pages ================================
@@ -205,6 +211,23 @@ class ComicXia : HttpSource() {
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used.")
 
     // ========================= Helpers ====================================
+
+    /**
+     * Parses an ISO-8601 datetime string with optional fractional seconds and timezone offset.
+     * Example input: "2025-11-29T02:36:51.910327+08:00"
+     */
+    private fun parseDate(dateStr: String?): Long {
+        if (dateStr.isNullOrBlank()) return 0L
+        return try {
+            // Strip sub-second precision, keep timezone: "2025-11-29T02:36:51+08:00"
+            val normalized = dateStr.replaceFirst(Regex("\\.\\d+"), "")
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US)
+                .parse(normalized)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
 
     private fun parseMangaListResponse(response: Response): MangasPage {
         val body = response.body.string()
