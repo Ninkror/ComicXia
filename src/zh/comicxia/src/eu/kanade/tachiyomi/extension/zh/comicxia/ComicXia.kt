@@ -1,7 +1,6 @@
 package eu.kanade.tachiyomi.extension.zh.comicxia
 
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -17,7 +16,6 @@ import kotlinx.serialization.json.floatOrNull
 import okhttp3.Headers
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -115,49 +113,11 @@ class ComicXia : HttpSource() {
             val id = q.removePrefix(ID_SEARCH_PREFIX)
             return GET("$apiBase/comics/$id", headers)
         }
-        
-        var isFilterSearch = false
-        var categoryId = ""
-        var region = ""
-        var status = ""
-        var tagId = ""
-        var sort = "updated"
-
-        filters.forEach { filter ->
-            when (filter) {
-                is CategoryFilter -> categoryId = filter.selected
-                is RegionFilter -> region = filter.selected
-                is StatusFilter -> status = filter.selected
-                is SortFilter -> sort = filter.selected
-                is TagFilter -> tagId = filter.selected
-                else -> {}
-            }
-        }
-
-        if (categoryId.isNotEmpty() || region.isNotEmpty() || status.isNotEmpty() || tagId.isNotEmpty() || sort != "updated") {
-            isFilterSearch = true
-        }
-
-        if (isFilterSearch && q.isEmpty()) {
-            val url = "$baseUrl/categories".toHttpUrlOrNull()!!.newBuilder()
-                .addQueryParameter("page", page.toString())
-            if (categoryId.isNotEmpty()) url.addQueryParameter("category_id", categoryId)
-            if (region.isNotEmpty()) url.addQueryParameter("region", region)
-            if (status.isNotEmpty()) url.addQueryParameter("status", status)
-            if (tagId.isNotEmpty()) url.addQueryParameter("tag_id", tagId)
-            url.addQueryParameter("sort", sort)
-            
-            return GET(url.toString(), headers)
-        }
-
-        // Default keyword API search
         return GET("$apiBase/comics?keyword=$q&page=$page&limit=20", headers)
     }
 
     override fun searchMangaParse(response: Response): MangasPage {
-        val url = response.request.url.toString()
-        
-        if (response.request.url.pathSegments.last() != "comics" && !url.contains("/categories")) {
+        if (response.request.url.pathSegments.last() != "comics") {
             // It was an ID search request which routes to details endpoint
             val manga = try {
                 mangaDetailsParse(response)
@@ -166,25 +126,6 @@ class ComicXia : HttpSource() {
             }
             return MangasPage(listOf(manga), false)
         }
-        
-        // If it's the categories HTML page
-        if (url.contains("/categories")) {
-            val document = Jsoup.parse(response.body.string())
-            val mangas = document.select("a[href^=/comics/]").mapNotNull { el ->
-                val link = el.attr("href")
-                if (link == "/comics/") return@mapNotNull null
-                SManga.create().apply {
-                    this.url = link
-                    title = el.select("p.truncate, h2, span, h3").first()?.text() ?: "Unknown"
-                    thumbnail_url = el.select("img").attr("src").ifBlank { el.select("img").attr("data-src") }
-                }
-            }
-            // Check if pagination has a next button or just check size
-            val hasNextPage = mangas.size >= 24 // Next.js list seems to have larger pages
-            
-            return MangasPage(mangas, hasNextPage)
-        }
-        
         return parseMangaListResponse(response)
     }
 
@@ -374,71 +315,6 @@ class ComicXia : HttpSource() {
         val hasNextPage = data.size >= 20 && mangas.size < total
         return MangasPage(mangas, hasNextPage)
     }
-
-    // =============================== Filters ==============================
-
-    override fun getFilterList() = FilterList(
-        CategoryFilter(),
-        RegionFilter(),
-        StatusFilter(),
-        SortFilter(),
-        TagFilter()
-    )
-
-    private open class UriPartFilter(
-        name: String,
-        val vals: Array<Pair<String, String>>
-    ) : Filter.Select<String>(name, vals.map { it.first }.toTypedArray()) {
-        val selected: String
-            get() = vals[state].second
-    }
-
-    private class CategoryFilter : UriPartFilter("分类", arrayOf(
-        Pair("全部", ""),
-        Pair("女性向", "6"),
-        Pair("一般", "1"),
-        Pair("BL", "2"),
-        Pair("GL", "3"),
-        Pair("禁漫", "4"),
-        Pair("其他", "5"),
-    ))
-
-    private class RegionFilter : UriPartFilter("地区", arrayOf(
-        Pair("全部", ""),
-        Pair("日本", "1"),
-        Pair("韩国", "2"),
-        Pair("中国", "3"),
-        Pair("欧美", "4"),
-        Pair("其他", "5")
-    ))
-
-    private class StatusFilter : UriPartFilter("状态", arrayOf(
-        Pair("全部", ""),
-        Pair("连载中", "1"),
-        Pair("已完结", "2")
-    ))
-
-    private class SortFilter : UriPartFilter("排序", arrayOf(
-        Pair("最新更新", "updated"),
-        Pair("最多点击", "view"),
-        Pair("最新发布", "created")
-    ))
-
-    private class TagFilter : UriPartFilter("热门标签 (仅列出部分)", arrayOf(
-        Pair("全部", ""),
-        Pair("NTR", "563"),
-        Pair("纯爱", "430"),
-        Pair("大胸", "211"),
-        Pair("后宫", "1480"),
-        Pair("丝袜", "1401"),
-        Pair("人妻", "340"),
-        Pair("乱伦", "177"),
-        Pair("姐弟", "581"),
-        Pair("催眠", "1893"),
-        Pair("老师", "1925"),
-        Pair("百合", "2435"),
-        Pair("伪娘", "916")
-    ))
 
     companion object {
         const val ID_SEARCH_PREFIX = "id:"
