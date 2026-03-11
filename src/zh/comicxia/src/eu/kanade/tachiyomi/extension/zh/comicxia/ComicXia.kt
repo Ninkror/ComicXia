@@ -1,12 +1,15 @@
-package eu.kanade.tachiyomi.extension.zh.comicxia
-
+import android.content.SharedPreferences
+import androidx.preference.ListPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import keiyoushi.utils.getPreferences
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -38,7 +41,7 @@ import javax.crypto.spec.SecretKeySpec
  *   GET /api/v1/comics/{id}/chapters?page=N&limit=50 → chapter list (paginated, max 50/page)
  *   GET /read/{chapterId}                         → reader page (images via Next.js payload)
  */
-class ComicXia : HttpSource() {
+class ComicXia : HttpSource(), ConfigurableSource {
 
     override val name = "ComicXia"
     override val baseUrl = "https://www.comicxia.com"
@@ -56,6 +59,8 @@ class ComicXia : HttpSource() {
         .add("Accept", "application/json")
 
     private val json = Json { ignoreUnknownKeys = true }
+
+    private val preferences: SharedPreferences = getPreferences()
 
     override val client = network.client.newBuilder()
         .addInterceptor(::imageIntercept)
@@ -249,11 +254,23 @@ class ComicXia : HttpSource() {
             .distinct()
             .toList()
 
+        val hostPref = preferences.getString(IMAGE_HOST_PREF_KEY, IMAGE_HOST_DEFAULT)!!
+
         return urls.mapIndexed { i, url ->
-            val finalUrl = if (key != null && iv != null) {
-                "$url#key=$key&iv=$iv"
-            } else {
+            // Replace host dynamically based on user setting
+            val modifiedUrl = try {
+                val httpUrl = okhttp3.HttpUrl.parse(url)
+                if (httpUrl != null) {
+                    httpUrl.newBuilder().host(hostPref).build().toString()
+                } else url
+            } catch (e: Exception) {
                 url
+            }
+
+            val finalUrl = if (key != null && iv != null) {
+                "$modifiedUrl#key=$key&iv=$iv"
+            } else {
+                modifiedUrl
             }
             Page(i, imageUrl = finalUrl)
         }
@@ -316,7 +333,46 @@ class ComicXia : HttpSource() {
         return MangasPage(mangas, hasNextPage)
     }
 
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val imageHostPref = ListPreference(screen.context).apply {
+            key = IMAGE_HOST_PREF_KEY
+            title = "更换图片来源(线路)"
+            summary = "如果章节内的图片加载失败或缓慢，请尝试更换线路。"
+            entries = arrayOf(
+                "图源 1 (mwfimsvfast27.cc)",
+                "图源 2 (mwappimgs.cc)",
+                "图源 3 (mwfimsvfast6.cc)",
+                "图源 4 移动友好 (mwfimsvfast16.cc)",
+                "图源 1 备用 (mwfimsvfast17.cc)",
+                "图源 4 (mwfimsvfast18.cc)",
+                "图源 5 (mwfimsvfast9.cc)",
+                "图源 5 备用 (mwfimsvfast20.cc)",
+                "新节点 (mwfimsvfast26.cc)"
+            )
+            entryValues = arrayOf(
+                "mwfimsvfast27.cc",
+                "mwappimgs.cc",
+                "mwfimsvfast6.cc",
+                "mwfimsvfast16.cc",
+                "mwfimsvfast17.cc",
+                "mwfimsvfast18.cc",
+                "mwfimsvfast9.cc",
+                "mwfimsvfast20.cc",
+                "mwfimsvfast26.cc"
+            )
+            setDefaultValue(IMAGE_HOST_DEFAULT)
+
+            setOnPreferenceChangeListener { _, newValue ->
+                val selected = newValue as String
+                preferences.edit().putString(IMAGE_HOST_PREF_KEY, selected).commit()
+            }
+        }
+        screen.addPreference(imageHostPref)
+    }
+
     companion object {
         const val ID_SEARCH_PREFIX = "id:"
+        private const val IMAGE_HOST_PREF_KEY = "PREF_IMAGE_HOST"
+        private const val IMAGE_HOST_DEFAULT = "mwappimgs.cc"
     }
 }
