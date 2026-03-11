@@ -216,21 +216,21 @@ class ComicXia : HttpSource() {
      * Parses an ISO-8601 datetime string with optional fractional seconds and timezone offset.
      * Example input: "2025-11-29T02:36:51.910327+08:00"
      *
-     * `SimpleDateFormat` pattern "XXX" (colon timezone like +08:00) is only reliable on
-     * Android API 24+. We strip fractional seconds and remove the colon before parsing so
-     * it works on all versions using the "Z" pattern.
+     * We extract the fixed-length date+time prefix (19 chars) and the last 6-char tz token,
+     * then remove the colon from the tz so SimpleDateFormat "Z" pattern can parse it.
      */
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZ", Locale.US)
 
     private fun parseDate(dateStr: String?): Long {
-        if (dateStr.isNullOrBlank()) return 0L
+        if (dateStr.isNullOrBlank() || dateStr.length < 19) return 0L
         return try {
             // "2025-11-29T02:36:51.910327+08:00"
-            // → strip sub-seconds → "2025-11-29T02:36:51+08:00"
-            // → remove colon in tz offset → "2025-11-29T02:36:51+0800"
-            val noFraction = dateStr.replaceFirst(Regex("\\.\\d+"), "")
-            val noColon = noFraction.replace(Regex("([+-]\\d{2}):(\\d{2})$"), "$1$2")
-            dateFormat.parse(noColon)?.time ?: 0L
+            //  take first 19 chars → "2025-11-29T02:36:51"
+            //  take last 6 chars   → "+08:00"
+            //  strip colon         → "+0800"
+            val base = dateStr.substring(0, 19) // "2025-11-29T02:36:51"
+            val tz = dateStr.takeLast(6).replace(":", "") // "+08:00" -> "+0800"
+            dateFormat.parse("$base$tz")?.time ?: 0L
         } catch (e: Exception) {
             0L
         }
